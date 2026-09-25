@@ -134,50 +134,221 @@ const CRATE = { hp: 260, bulletDmg: 20, penLossPerM: 0.3, minPen: 0.2, deflect: 
 const LEAN = { dist: 0.38, roll: 12 * DEG, speed: 7 };
 const MOVE = { walk: 4.2, sprint: 6.0, crouch: 1.8, adsMul: 0.6, jump: 3.8, gravity: 9.81 };
 // забирання на перешкоду (Space біля ящика/блока): висота, яку можна подолати
-const MANTLE = { minRise: 0.25, maxRise: 1.35 };
+const MANTLE = { minRise: 0.25, maxRise: 1.5 };
 const BLOOD = { max: 1500, poolSize: 1.5, poolGrow: 5 };
 const loudness = sp => sp < 0.5 ? 0 : sp < 2.3 ? 0.15 : sp < 4.7 ? 0.55 : 1;
 
-// ================= MAP =================
-const CELL = 2;
-const MAP = [
-  '########################',
-  '#P.....#...S....#.....E#',
-  '#......#..b.....#......#',
-  '#..bb..#........#..bb..#',
-  '#...............B......#',
-  '#......####..####......#',
-  '#..b...................#',
-  '#S....................S#',
-  '####..b....BB....b..####',
-  '#.........#..#.........#',
-  '#..B......#..#......B..#',
-  '#......bb........bb....#',
-  '#......bb........bb....#',
-  '#..B......#..#......B..#',
-  '#.........#..#.........#',
-  '####..b....BB....b..####',
-  '#S....................S#',
-  '#...................b..#',
-  '#......####..####......#',
-  '#......B...............#',
-  '#..bb..#........#..bb..#',
-  '#......#.....b..#......#',
-  '#E.....#...S....#.....P#',
-  '########################',
-];
-const ROWS = MAP.length, COLS = MAP[0].length;
-const BLOCK = { '#': { h: 3.5, c: 0xb9b3a7 }, 'B': { h: 2.2, c: 0x8b96a1 }, 'b': { h: 1.2, c: 0xa3824f } };
-const allBoxes = [], walk = [], spawns = [];
-let boxes = [];
-for (let z = 0; z < ROWS; z++) {
-  walk.push([]);
-  for (let x = 0; x < COLS; x++) {
-    const ch = MAP[z][x], t = BLOCK[ch];
-    walk[z].push(!t);
-    if (t) allBoxes.push({ minx: x * CELL, miny: 0, minz: z * CELL, maxx: (x + 1) * CELL, maxy: t.h, maxz: (z + 1) * CELL, ch, cx: x, cz: z, hp: CRATE.hp, idx: 0, gi: allBoxes.length });
-    if ('PES'.includes(ch)) spawns.push(new V3(x * CELL + CELL / 2, 0, z * CELL + CELL / 2));
+// ================= MAPS =================
+// A map is a set of axis-aligned boxes (colliders + visuals) on a cell grid. Cells free at floor level form the
+// bots' navigation grid. The map is picked at load: #map=… in the link (so a PvP room shares it), else the saved setting.
+const settings = { bots: 1, kills: 5, botSnipers: 'none', map: 'trenches' };
+try { Object.assign(settings, JSON.parse(localStorage.getItem('akd_settings') || '{}')); } catch (e) {}
+const saveSettings = () => { try { localStorage.setItem('akd_settings', JSON.stringify(settings)); } catch (e) {} };
+const MAP_IDS = ['blocks', 'trenches'];
+const mapFromUrl = () => (location.hash.match(/map=([a-z]+)/) || [])[1] || null;
+const MAP_ID = [mapFromUrl(), settings.map].find(m => MAP_IDS.includes(m)) || 'trenches';
+
+// c: instance colour; top/side: vertex-colour gradient (grass on top, clay on the walls); hidden: collider only
+const BLOCK = {
+  '#': { c: 0xb9b3a7 }, 'B': { c: 0x8b96a1 }, 'b': { c: 0xa3824f },
+  'e': { c: 0xffffff, top: 0x707246, side: 0x5b4633 },  // earth
+  'c': { c: 0xffffff, top: 0x4b4232, side: 0x47392a },  // shell crater, scorched
+  'm': { c: 0xffffff, top: 0x3c4a2b, side: 0x3a3226 },  // boundary berm / tree line
+  's': { c: 0x8a7e5b },  // sandbags
+  'w': { c: 0x6a4a2c },  // logs, planks
+  'r': { c: 0x9a8b79 },  // ruined brick house
+  't': { c: 0x3a3029 },  // burnt trees
+  'v': { c: 0x4b5339 },  // wrecked armoured vehicle
+  'x': { hidden: true },
+};
+const mkBox = (minx, miny, minz, maxx, maxy, maxz, ch, cx = -1, cz = -1) => ({ minx, miny, minz, maxx, maxy, maxz, ch, cx, cz, hp: CRATE.hp, idx: 0, gi: 0 });
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+function buildBlocksMap() {
+  const MAP = [
+    '########################',
+    '#P.....#...S....#.....E#',
+    '#......#..b.....#......#',
+    '#..bb..#........#..bb..#',
+    '#...............B......#',
+    '#......####..####......#',
+    '#..b...................#',
+    '#S....................S#',
+    '####..b....BB....b..####',
+    '#.........#..#.........#',
+    '#..B......#..#......B..#',
+    '#......bb........bb....#',
+    '#......bb........bb....#',
+    '#..B......#..#......B..#',
+    '#.........#..#.........#',
+    '####..b....BB....b..####',
+    '#S....................S#',
+    '#...................b..#',
+    '#......####..####......#',
+    '#......B...............#',
+    '#..bb..#........#..bb..#',
+    '#......#.....b..#......#',
+    '#E.....#...S....#.....P#',
+    '########################',
+  ];
+  const H = { '#': 3.5, 'B': 2.2, 'b': 1.2 }, cell = 2, boxes = [], spawns = [];
+  MAP.forEach((row, z) => [...row].forEach((ch, x) => {
+    if (H[ch]) boxes.push(mkBox(x * cell, 0, z * cell, (x + 1) * cell, H[ch], (z + 1) * cell, ch, x, z));
+    if ('PES'.includes(ch)) spawns.push(new V3(x * cell + cell / 2, 0, z * cell + cell / 2));
+  }));
+  return { cell, cols: MAP[0].length, rows: MAP.length, boxes, spawns, decor: [], wires: [],
+    env: { sky: 0xa9bccd, fog: [35, 110], hemi: [0xe4ecff, 0x524636, 1.5], sun: [0xfff1dd, 2.2], floor: 'checker' } };
+}
+
+// Two trench systems facing each other across a shelled no-man's land: crenellated fire trenches with firing bays and
+// sandbagged parapets, a support trench behind each, zigzag communication trenches, roofed dugouts, craters,
+// a burnt shelterbelt, a ruined house, a wrecked APC, anti-tank hedgehogs and barbed wire.
+// Seeded, so every player in a PvP room generates the exact same map.
+function buildTrenchMap() {
+  const cell = 1, W = 56, D = 76, G = 1.35, rnd = mulberry32(1991);
+  const R = (a, b) => a + rnd() * (b - a);
+  const hgt = Array.from({ length: D }, () => new Array(W).fill(G));
+  const inside = (x, z) => x > 0 && z > 0 && x < W - 1 && z < D - 1;
+  const dig = (x, z) => { if (inside(x, z)) hgt[z][x] = 0; };
+  const digRect = (x0, z0, x1, z1) => { for (let z = Math.min(z0, z1); z <= Math.max(z0, z1); z++) for (let x = Math.min(x0, x1); x <= Math.max(x0, x1); x++) dig(x, z); };
+  const boxes = [], decor = [], wires = [], spawns = [], bays = [];
+
+  // fire trench: bays and traverses, so a burst along the trench can't sweep all of it
+  function fireTrench(z0, enemy) {
+    let x = 2, off = 0;
+    while (x < W - 4) {
+      const len = Math.min(W - 3 - x, 5 + Math.floor(rnd() * 3)), z = z0 + off;
+      digRect(x, z, x + len, z);
+      digRect(x + 1, z + enemy, x + len - 1, z + enemy); // firing bay toward the enemy
+      bays.push({ x0: x + 1, x1: x + len - 1, z: z + enemy, enemy });
+      const nOff = off === 0 ? -2 * enemy : 0;
+      digRect(x + len, z, x + len, z0 + nOff);          // traverse
+      off = nOff; x += len;
+    }
   }
+  function commTrench(x, zA, zB) {
+    const s = Math.sign(zB - zA); let cx = x;
+    for (let z = zA; z !== zB + s; z += s) {
+      dig(cx, z);
+      if (Math.abs(z - zA) % 5 === 4) { const nx = cx === x ? x + 2 : x; digRect(cx, z, nx, z); cx = nx; }
+    }
+  }
+  // south (z grows toward the south): enemy is north (-1)
+  fireTrench(60, -1); digRect(3, 69, W - 4, 69);
+  for (const x of [8, 27, 46]) commTrench(x, 61, 69);
+  fireTrench(15, 1); digRect(3, 6, W - 4, 6);
+  for (const x of [9, 28, 45]) commTrench(x, 14, 6);
+  // dugouts: dug-out rooms behind the support trench, roofed with logs under an earth mound
+  const dugouts = [[14, 71, 18, 73, 16, 70], [35, 2, 39, 4, 37, 5]];
+  for (const [x0, z0, x1, z1, ex, ez] of dugouts) { digRect(x0, z0, x1, z1); dig(ex, ez); }
+  // shell craters: two depths, mostly in no-man's land
+  for (let i = 0; i < 36; i++) {
+    const cx = R(3, W - 3), cz = i < 28 ? R(19, 57) : R(3, D - 3), r = R(1.3, 3.0);
+    for (let z = Math.floor(cz - r); z <= Math.ceil(cz + r); z++) for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+      if (!inside(x, z) || hgt[z][x] !== G) continue;
+      const d = Math.hypot(x + 0.5 - cx, z + 0.5 - cz);
+      if (d < r) hgt[z][x] = d < r * 0.55 ? 0.45 : 0.9;
+    }
+  }
+  for (let z = 0; z < D; z++) for (let x = 0; x < W; x++) if (!inside(x, z)) hgt[z][x] = 4.2;
+  // merge equal-height cells into rectangles: a few hundred colliders instead of thousands
+  const used = Array.from({ length: D }, () => new Uint8Array(W));
+  for (let z = 0; z < D; z++) for (let x = 0; x < W; x++) {
+    const h = hgt[z][x]; if (used[z][x] || h === 0) continue;
+    let w = 1; while (x + w < W && !used[z][x + w] && hgt[z][x + w] === h) w++;
+    let d = 1;
+    grow: while (z + d < D) { for (let k = 0; k < w; k++) if (used[z + d][x + k] || hgt[z + d][x + k] !== h) break grow; d++; }
+    for (let zz = z; zz < z + d; zz++) for (let xx = x; xx < x + w; xx++) used[zz][xx] = 1;
+    boxes.push(mkBox(x, 0, z, x + w, h, z + d, h === G ? 'e' : h > G ? 'm' : 'c'));
+  }
+  // dugout roofs + mounds
+  for (const [x0, z0, x1, z1, , ez] of dugouts) {
+    boxes.push(mkBox(x0, 1.95, z0, x1 + 1, 2.3, z1 + 1, 'w'));
+    // mound around the roof; over the entrance it starts at roof height so you can walk in under it
+    boxes.push(mkBox(x0 - 1, ez === z0 - 1 ? 1.95 : G, z0 - 1, x1 + 2, 2.3, z0, 'e'), mkBox(x0 - 1, ez === z1 + 1 ? 1.95 : G, z1 + 1, x1 + 2, 2.3, z1 + 2, 'e'));
+    boxes.push(mkBox(x0 - 1, G, z0, x0, 2.3, z1 + 1, 'e'), mkBox(x1 + 1, G, z0, x1 + 2, 2.3, z1 + 1, 'e'));
+    for (let i = 0; i < 5; i++) decor.push({ ch: 'log', x: R(x0, x1 + 1), y: 2.34, z: R(z0, z1 + 1), sx: 0.22, sy: 0.22, sz: R(2, 3.5), rx: 0, ry: R(0, 3.14), rz: 0 });
+  }
+  // sandbagged parapets on the firing bays (low enough to shoot over standing, high enough to hide crouched)
+  for (const b of bays) {
+    const ze = b.z + b.enemy, z0 = b.enemy < 0 ? ze + 0.45 : ze, z1 = b.enemy < 0 ? ze + 1 : ze + 0.55;
+    const gap = b.x0 + 1 + Math.floor(rnd() * Math.max(1, b.x1 - b.x0 - 1));
+    if (gap > b.x0) boxes.push(mkBox(b.x0, G, z0, gap, G + 0.22, z1, 's'));
+    if (gap + 1 <= b.x1 + 1) boxes.push(mkBox(gap + 1, G, z0, b.x1 + 1, G + 0.22, z1, 's'));
+    // ammo crates at the end of some bays (destructible cover)
+    if (rnd() < 0.4) boxes.push(mkBox(b.x1, 0, b.z, b.x1 + 1, 0.8, b.z + 1, 'b', b.x1, b.z));
+  }
+  for (const [x0, z0] of dugouts) boxes.push(mkBox(x0, 0, z0, x0 + 1, 0.8, z0 + 1, 'b', x0, z0));
+  // burnt shelterbelt (лісосмуга) across the middle: broken trunks and fallen logs
+  for (let x = 3; x < W - 3; x += R(1.6, 2.8)) {
+    if (rnd() < 0.2) continue;
+    const z = 37.5 + R(-0.7, 0.7), s = R(0.25, 0.45), h = rnd() < 0.3 ? R(0.5, 1.4) : R(2, 6.5);
+    boxes.push(mkBox(x - s / 2, G, z - s / 2, x + s / 2, G + h, z + s / 2, 't'));
+    if (h > 3) for (let k = 0; k < 2; k++) decor.push({ ch: 'log', x: x + R(-0.6, 0.6), y: G + h * R(0.6, 0.9), z: z + R(-0.6, 0.6), sx: 0.1, sy: R(1, 2), sz: 0.1, rx: R(-0.9, 0.9), ry: 0, rz: R(-0.9, 0.9) });
+    if (rnd() < 0.15) { const len = R(2.5, 4); boxes.push(mkBox(x, G, z + 1, x + len, G + 0.45, z + 1.45, 't')); }
+  }
+  // ruined house on the east flank
+  const hx0 = 44, hz0 = 40, hx1 = 51, hz1 = 46;
+  const wall = (x0, z0, x1, z1) => {
+    const alongX = z0 === z1, n = Math.round(alongX ? x1 - x0 : z1 - z0);
+    for (let i = 0; i < n; i++) {
+      if (rnd() < 0.22) continue; // breach / window
+      const h = R(0.7, 3.1);
+      if (alongX) boxes.push(mkBox(x0 + i, G, z0 - 0.15, x0 + i + 1, G + h, z0 + 0.15, 'r'));
+      else boxes.push(mkBox(x0 - 0.15, G, z0 + i, x0 + 0.15, G + h, z0 + i + 1, 'r'));
+    }
+  };
+  wall(hx0, hz0, hx1, hz0); wall(hx0, hz1, hx1, hz1); wall(hx0, hz0, hx0, hz1); wall(hx1, hz0, hx1, hz1); wall(hx0, 43, 48, 43);
+  boxes.push(mkBox(49.5, G, 44, 50.3, G + 4.2, 44.8, 'r')); // chimney
+  for (let i = 0; i < 9; i++) { const x = R(hx0 - 1, hx1 + 1), z = R(hz0 - 1, hz1 + 1), s = R(0.4, 1.1); boxes.push(mkBox(x, G, z, x + s, G + R(0.2, 0.55), z + s * R(0.6, 1.2), 'r')); }
+  // wrecked APC on the west flank
+  boxes.push(mkBox(9, G, 42, 11.6, G + 1.35, 47.5, 'v'), mkBox(9.6, G + 1.35, 43.4, 11, G + 1.9, 45.2, 'v'));
+  decor.push({ ch: 'steel', x: 10.3, y: G + 1.7, z: 42.4, sx: 0.09, sy: 0.09, sz: 2.2, rx: 0.15, ry: 0.2, rz: 0 });
+  decor.push({ ch: 'steel', x: 8.85, y: G + 0.35, z: 44.8, sx: 0.3, sy: 0.7, sz: 5.4, rx: 0, ry: 0, rz: 0 }, { ch: 'steel', x: 11.75, y: G + 0.35, z: 44.8, sx: 0.3, sy: 0.7, sz: 5.4, rx: 0, ry: 0, rz: 0 });
+  // anti-tank hedgehogs: three crossed beams, a small collider under them
+  for (const zr of [21, 54]) for (let x = 4; x < W - 4; x += R(5, 9)) {
+    const z = zr + R(-1, 1), cz = Math.floor(z), cx = Math.floor(x);
+    if (hgt[cz]?.[cx] !== G) continue;
+    boxes.push(mkBox(x - 0.45, G, z - 0.45, x + 0.45, G + 0.9, z + 0.45, 'x'));
+    for (const [rx, ry, rz] of [[0.95, 0, 0], [0, 0, 0.95], [0, 0.785, 0]]) decor.push({ ch: 'steel', x, y: G + 0.55, z, sx: 0.12, sy: rx || rz ? 1.6 : 0.12, sz: rx || rz ? 0.12 : 1.6, rx, ry, rz });
+  }
+  // barbed wire in front of both lines: posts + three strands and crossed wires
+  for (const zw of [19, 56]) {
+    let prev = null;
+    for (let x = 2; x < W - 2; x += R(2, 3)) {
+      const z = zw + R(-0.4, 0.4), c = hgt[Math.floor(z)]?.[Math.floor(x)] ?? G, y0 = c > 0 && c <= G ? c : G;
+      decor.push({ ch: 'post', x, y: y0 + 0.6, z, sx: 0.08, sy: 1.25, sz: 0.08, rx: R(-0.1, 0.1), ry: 0, rz: R(-0.1, 0.1) });
+      if (prev) {
+        for (const hh of [0.3, 0.7, 1.1]) wires.push([prev.x, prev.y + hh, prev.z, x, y0 + hh + R(-0.05, 0.05), z]);
+        wires.push([prev.x, prev.y + 0.2, prev.z, x, y0 + 1.1, z], [prev.x, prev.y + 1.1, prev.z, x, y0 + 0.2, z]);
+      }
+      prev = { x, y: y0, z };
+    }
+  }
+  // spawns in the support trenches and dugouts of both sides
+  for (const x of [6, 20, 34, 48]) { spawns.push(new V3(x + 0.5, 0, 69.5), new V3(x + 0.5, 0, 6.5)); }
+  spawns.push(new V3(16.5, 0, 72.5), new V3(37.5, 0, 3.5));
+  return { cell, cols: W, rows: D, boxes, spawns, decor, wires, crateColor: 0x5a633b,
+    env: { sky: 0x9aa4aa, fog: [22, 88], hemi: [0xd2d8dc, 0x4a3f30, 1.25], sun: [0xf0ebe2, 1.5], floor: 'mud' } };
+}
+
+const MAPDEF = MAP_ID === 'trenches' ? buildTrenchMap() : buildBlocksMap();
+const CELL = MAPDEF.cell, COLS = MAPDEF.cols, ROWS = MAPDEF.rows;
+if (MAPDEF.crateColor) BLOCK.b.c = MAPDEF.crateColor;
+const allBoxes = MAPDEF.boxes, spawns = MAPDEF.spawns;
+allBoxes.forEach((b, i) => { b.gi = i; });
+let boxes = [];
+// bots walk only where nothing low stands on the floor (trench bottoms, open ground of the block map)
+const walk = Array.from({ length: ROWS }, () => new Array(COLS).fill(true));
+for (const b of allBoxes) {
+  if (b.miny >= 1) continue;
+  for (let z = Math.max(0, Math.floor(b.minz / CELL)); z < Math.min(ROWS, Math.ceil(b.maxz / CELL)); z++)
+    for (let x = Math.max(0, Math.floor(b.minx / CELL)); x < Math.min(COLS, Math.ceil(b.maxx / CELL)); x++) {
+      const cx = (x + 0.5) * CELL, cz = (z + 0.5) * CELL;
+      if (cx > b.minx && cx < b.maxx && cz > b.minz && cz < b.maxz) walk[z][x] = false;
+    }
 }
 const MAP_CENTER = new V3(COLS * CELL / 2, 0, ROWS * CELL / 2);
 
@@ -191,56 +362,92 @@ renderer.autoClear = false;
 renderer.info.autoReset = false;
 document.body.prepend(renderer.domElement);
 
+const ENV = MAPDEF.env;
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xa9bccd);
-scene.fog = new THREE.Fog(0xa9bccd, 35, 110);
+scene.background = new THREE.Color(ENV.sky);
+scene.fog = new THREE.Fog(ENV.sky, ENV.fog[0], ENV.fog[1]);
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 250);
 camera.rotation.order = 'YXZ';
 
-scene.add(new THREE.HemisphereLight(0xe4ecff, 0x524636, 1.5));
-const sun = new THREE.DirectionalLight(0xfff1dd, 2.2);
+scene.add(new THREE.HemisphereLight(...ENV.hemi));
+const sun = new THREE.DirectionalLight(...ENV.sun);
 sun.position.set(MAP_CENTER.x + 18, 40, MAP_CENTER.z + 12);
 sun.target.position.copy(MAP_CENTER);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -34, right: 34, top: 34, bottom: -34, near: 1, far: 100 });
+{ const half = Math.max(COLS, ROWS) * CELL / 2 + 6; Object.assign(sun.shadow.camera, { left: -half, right: half, top: half, bottom: -half, near: 1, far: 110 }); }
 sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
 
-// floor with 1m checker for scale
+// floor: 1m checker on the block map, trodden mud at the bottom of the trenches
 {
   const c = document.createElement('canvas'); c.width = c.height = 128;
   const g = c.getContext('2d');
-  g.fillStyle = '#7e807b'; g.fillRect(0, 0, 128, 128);
-  g.fillStyle = '#74766f'; g.fillRect(0, 0, 64, 64); g.fillRect(64, 64, 64, 64);
-  g.strokeStyle = '#62645e'; g.lineWidth = 2; g.strokeRect(0, 0, 128, 128);
+  if (ENV.floor === 'mud') {
+    g.fillStyle = '#4a3b2c'; g.fillRect(0, 0, 128, 128);
+    for (let i = 0; i < 90; i++) { g.fillStyle = Math.random() < 0.5 ? 'rgba(30,22,15,.35)' : 'rgba(110,95,70,.25)'; g.beginPath(); g.arc(Math.random() * 128, Math.random() * 128, 2 + Math.random() * 9, 0, 7); g.fill(); }
+  } else {
+    g.fillStyle = '#7e807b'; g.fillRect(0, 0, 128, 128);
+    g.fillStyle = '#74766f'; g.fillRect(0, 0, 64, 64); g.fillRect(64, 64, 64, 64);
+    g.strokeStyle = '#62645e'; g.lineWidth = 2; g.strokeRect(0, 0, 128, 128);
+  }
   const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(COLS, ROWS);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(COLS * CELL / 2, ROWS * CELL / 2);
   tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 8;
   const floor = new THREE.Mesh(new THREE.PlaneGeometry(COLS * CELL, ROWS * CELL), new THREE.MeshLambertMaterial({ map: tex }));
   floor.rotation.x = -Math.PI / 2; floor.position.copy(MAP_CENTER); floor.receiveShadow = true;
   scene.add(floor);
 }
-// blocks: one InstancedMesh per type → 3 draw calls for whole level
+// blocks: one InstancedMesh per type (unit box scaled per instance) → a handful of draw calls for the whole level
 const blockMesh = {}, _col = new THREE.Color(), _mat4 = new THREE.Matrix4();
+const _bp = new V3(), _bsc = new V3(), _bq = new THREE.Quaternion();
 function baseColor(b) {
-  const n = Math.sin(b.minx * 12.9898 + b.minz * 78.233) * 43758.5453;
-  return _col.setHex(BLOCK[b.ch].c).offsetHSL(0, 0, ((n - Math.floor(n)) - 0.5) * 0.07);
+  const n = Math.sin(b.minx * 12.9898 + b.minz * 78.233) * 43758.5453, j = (n - Math.floor(n)) - 0.5;
+  return _col.setHex(BLOCK[b.ch].c).offsetHSL(0, 0, j * (BLOCK[b.ch].top !== undefined ? 0.12 : 0.07));
 }
+const boxMatrix = b => _mat4.compose(_bp.set((b.minx + b.maxx) / 2, b.miny, (b.minz + b.maxz) / 2), _bq, _bsc.set(b.maxx - b.minx, b.maxy - b.miny, b.maxz - b.minz));
 for (const [ch, t] of Object.entries(BLOCK)) {
-  const cells = allBoxes.filter(b => b.ch === ch);
-  const geo = new THREE.BoxGeometry(CELL, t.h, CELL); geo.translate(0, t.h / 2, 0);
-  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial(), cells.length);
-  cells.forEach((b, i) => { b.idx = i; mesh.setColorAt(i, baseColor(b)); });
+  const list = allBoxes.filter(b => b.ch === ch);
+  if (!list.length || t.hidden) continue;
+  const geo = new THREE.BoxGeometry(1, 1, 1); geo.translate(0, 0.5, 0);
+  if (t.top !== undefined) {
+    const pos = geo.attributes.position, nrm = geo.attributes.normal, cols = new Float32Array(pos.count * 3);
+    const top = new THREE.Color(t.top), side = new THREE.Color(t.side), c = new THREE.Color();
+    for (let i = 0; i < pos.count; i++) {
+      c.copy(nrm.getY(i) > 0.5 ? top : pos.getY(i) > 0.5 ? side.clone().lerp(top, 0.35) : side);
+      cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  }
+  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ vertexColors: t.top !== undefined }), list.length);
+  list.forEach((b, i) => { b.idx = i; mesh.setColorAt(i, baseColor(b)); });
   mesh.castShadow = mesh.receiveShadow = true; mesh.frustumCulled = false;
   scene.add(mesh); blockMesh[ch] = mesh;
+}
+// decoration without collision: wire posts, hedgehog beams, branches, vehicle parts
+{
+  const DECOR_C = { post: 0x5a4630, log: 0x3a3029, steel: 0x33372e };
+  for (const [ch, color] of Object.entries(DECOR_C)) {
+    const list = MAPDEF.decor.filter(d => d.ch === ch);
+    if (!list.length) continue;
+    const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial({ color }), list.length);
+    const e = new THREE.Euler();
+    list.forEach((d, i) => mesh.setMatrixAt(i, _mat4.compose(_bp.set(d.x, d.y, d.z), _bq.clone().setFromEuler(e.set(d.rx, d.ry, d.rz)), _bsc.set(d.sx, d.sy, d.sz))));
+    mesh.castShadow = true; mesh.frustumCulled = false; scene.add(mesh);
+  }
+  _bq.identity();
+  if (MAPDEF.wires.length) {
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAPDEF.wires.flat()), 3));
+    scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x2b2a27 })));
+  }
 }
 function resetLevel() {
   boxes = allBoxes.slice();
   for (const b of allBoxes) {
-    b.hp = CRATE.hp; walk[b.cz][b.cx] = false;
+    b.hp = CRATE.hp;
+    if (b.ch === 'b') walk[b.cz][b.cx] = false;
     const m = blockMesh[b.ch];
-    m.setMatrixAt(b.idx, _mat4.makeTranslation(b.minx + CELL / 2, 0, b.minz + CELL / 2)); m.setColorAt(b.idx, baseColor(b));
+    if (m) { m.setMatrixAt(b.idx, boxMatrix(b)); m.setColorAt(b.idx, baseColor(b)); }
   }
   for (const m of Object.values(blockMesh)) { m.instanceMatrix.needsUpdate = true; m.instanceColor.needsUpdate = true; }
   decals.count = 0; dNext = 0; decalBox.fill(null);
@@ -456,7 +663,7 @@ function updateGore(dt) {
     const x = px + gVel[i3] * dt, y = py + gVel[i3 + 1] * dt, z = pz + gVel[i3 + 2] * dt;
     let landed = false;
     if (y <= 0.002) { stainAt(k, x, 0, z, 0, 1, 0, null); landed = true; }
-    else if (y < 3.6) {
+    else if (y < 6) {
       for (const b of boxes) {
         if (x < b.minx || x > b.maxx || z < b.minz || z > b.maxz || y > b.maxy) continue;
         // entered this block: stain the face the drop came through
@@ -621,12 +828,18 @@ function overlapsAny(x, y, z, r, h) {
   for (const b of boxes) if (x + r > b.minx && x - r < b.maxx && z + r > b.minz && z - r < b.maxz && y + h > b.miny && y < b.maxy) return b;
   return null;
 }
+// walk up onto low obstacles (sandbags, rubble, crater lips) instead of being stopped by them
+function stepUp(e, b) {
+  const rise = b.maxy - e.pos.y;
+  if (!e.onGround || rise <= 0 || rise > 0.4 || overlapsAny(e.pos.x, b.maxy + 0.001, e.pos.z, e.r, e.h)) return false;
+  e.pos.y = b.maxy + 0.001; return true;
+}
 function moveBody(e, dt) {
   let b;
   e.pos.x += e.vel.x * dt;
-  if ((b = overlapsAny(e.pos.x, e.pos.y, e.pos.z, e.r, e.h))) { e.pos.x = e.vel.x > 0 ? b.minx - e.r - 1e-4 : b.maxx + e.r + 1e-4; e.vel.x = 0; }
+  if ((b = overlapsAny(e.pos.x, e.pos.y, e.pos.z, e.r, e.h)) && !stepUp(e, b)) { e.pos.x = e.vel.x > 0 ? b.minx - e.r - 1e-4 : b.maxx + e.r + 1e-4; e.vel.x = 0; }
   e.pos.z += e.vel.z * dt;
-  if ((b = overlapsAny(e.pos.x, e.pos.y, e.pos.z, e.r, e.h))) { e.pos.z = e.vel.z > 0 ? b.minz - e.r - 1e-4 : b.maxz + e.r + 1e-4; e.vel.z = 0; }
+  if ((b = overlapsAny(e.pos.x, e.pos.y, e.pos.z, e.r, e.h)) && !stepUp(e, b)) { e.pos.z = e.vel.z > 0 ? b.minz - e.r - 1e-4 : b.maxz + e.r + 1e-4; e.vel.z = 0; }
   const vy = e.vel.y, wasGround = e.onGround;
   e.pos.y += e.vel.y * dt; e.onGround = false;
   if (e.pos.y <= 0) { e.pos.y = 0; e.vel.y = 0; e.onGround = true; }
@@ -729,9 +942,6 @@ function leanRoom(c, side) {
   return h ? clamp((h.t - 0.2) / LEAN.dist, 0, 1) : 1;
 }
 
-const settings = { bots: 1, kills: 5, botSnipers: 'none' };
-try { Object.assign(settings, JSON.parse(localStorage.getItem('akd_settings') || '{}')); } catch (e) {}
-const saveSettings = () => { try { localStorage.setItem('akd_settings', JSON.stringify(settings)); } catch (e) {} };
 
 const BOT_COLORS = [0x8e2f28, 0x2f5a8e, 0x8e7a2f, 0x5e2f8e, 0x2f8e5a];
 const bots = [];
@@ -849,7 +1059,7 @@ function playerNoise(range) {
 // what the character stands on: 'wood' on top of a crate, otherwise concrete
 function surfaceOf(c) {
   if (c.pos.y < 0.05) return 'concrete';
-  for (const b of boxes) if (Math.abs(b.maxy - c.pos.y) < 0.06 && c.pos.x > b.minx - c.r && c.pos.x < b.maxx + c.r && c.pos.z > b.minz - c.r && c.pos.z < b.maxz + c.r) return b.ch === 'b' ? 'wood' : 'concrete';
+  for (const b of boxes) if (Math.abs(b.maxy - c.pos.y) < 0.06 && c.pos.x > b.minx - c.r && c.pos.x < b.maxx + c.r && c.pos.z > b.minz - c.r && c.pos.z < b.maxz + c.r) return b.ch === 'b' || b.ch === 'w' ? 'wood' : 'concrete';
   return 'concrete';
 }
 const pickRandom = a => a[Math.floor(Math.random() * a.length)];
@@ -1054,7 +1264,7 @@ function tryMantle() {
   for (const reach of [0.45, 0.75]) {
     const px = p.x + fx * reach, pz = p.z + fz * reach;
     for (const b of boxes) {
-      if (b.ch === '#' || px < b.minx || px > b.maxx || pz < b.minz || pz > b.maxz) continue;
+      if (b.ch === '#' || b.ch === 'm' || px < b.minx || px > b.maxx || pz < b.minz || pz > b.maxz) continue;
       const rise = b.maxy - p.y;
       if (rise < MANTLE.minRise || rise > MANTLE.maxRise) continue;
       const r = player.r + 0.02;
@@ -1105,7 +1315,7 @@ function botSetPath(b, target) {
 function randomWalkCell(b) {
   for (let i = 0; i < 50; i++) {
     const x = 1 + Math.floor(Math.random() * (COLS - 2)), z = 1 + Math.floor(Math.random() * (ROWS - 2));
-    const p = new V3(x * CELL + 1, 0, z * CELL + 1);
+    const p = new V3((x + 0.5) * CELL, 0, (z + 0.5) * CELL);
     if (walk[z][x] && p.distanceTo(b.pos) > 12) return p;
   }
   return MAP_CENTER.clone();
@@ -1368,7 +1578,7 @@ function damageCrate(box, amount, hx, hy, hz) {
     bloodMesh.instanceMatrix.needsUpdate = true;
     for (let k = pools.length - 1; k >= 0; k--) if (!bloodBox[pools[k].i]) pools.splice(k, 1);
     decals.instanceMatrix.needsUpdate = true;
-    for (let i = 0; i < 6; i++) emit(box.minx + Math.random() * CELL, Math.random() * 1.2, box.minz + Math.random() * CELL, 0, 1, 0, 14, C_WOOD, 4, 0.8, 1.2);
+    for (let i = 0; i < 6; i++) emit(box.minx + Math.random() * (box.maxx - box.minx), Math.random() * box.maxy, box.minz + Math.random() * (box.maxz - box.minz), 0, 1, 0, 14, C_WOOD, 4, 0.8, 1.2);
     play3d(buf.thud, new V3(box.minx + 1, 0.6, box.minz + 1), { gain: 1.4, lp: 700, rate: 0.7 });
     play3d(buf.wood, new V3(box.minx + 1, 0.6, box.minz + 1), { gain: 1.2, rate: 0.6 });
   } else {
@@ -1583,12 +1793,13 @@ function updateHUD(dt) {
   if (hud.msgT > 0) { hud.msgT -= dt; $('msg').style.opacity = Math.min(1, hud.msgT * 2); }
 }
 const SETTING_ROWS = [
+  { k: 'map', label: 'Мапа', opts: [['blocks', 'Полігон'], ['trenches', 'Окопи']] },
   { k: 'kills', label: 'Вбивств до перемоги', opts: [[3, '3'], [5, '5'], [10, '10'], [15, '15'], [20, '20']] },
   { k: 'bots', label: 'Ботів (гра з ботами)', opts: [[1, '1'], [2, '2'], [3, '3'], [4, '4'], [5, '5']] },
   { k: 'botSnipers', label: 'Снайперки у ботів', opts: [['none', 'Ні'], ['half', 'Половина'], ['all', 'Всі']] },
 ];
 const settingRow = r => `<div class="row"><span class="lbl">${r.label}</span>${r.opts.map(([v, t]) =>
-  `<button data-k="${r.k}" data-v="${v}" class="${settings[r.k] === v ? 'on' : ''}">${t}</button>`).join('')}</div>`;
+  `<button data-k="${r.k}" data-v="${v}" class="${(r.k === 'map' ? MAP_ID : settings[r.k]) === v ? 'on' : ''}">${t}</button>`).join('')}</div>`;
 const HELP = () => `<table>
      <tr><td>WASD</td><td>рух · Shift — біг (зброя опущена)</td></tr>
      <tr><td>Q / E</td><td>нахил — визирнути з-за кута</td></tr>
@@ -1654,7 +1865,7 @@ const cleanName = n => String(n || '').replace(/[\u0000-\u001f\u007f]/g, '').tri
 let myName = 'Гравець';
 try { myName = cleanName(localStorage.getItem('akd_name')); } catch (e) {}
 const roomFromUrl = () => (location.hash.match(/room=([a-z0-9]{3,12})/) || [])[1] || null;
-const shareLink = () => `${location.origin}${location.pathname}#room=${net.room}`;
+const shareLink = () => `${location.origin}${location.pathname}#room=${net.room}&map=${MAP_ID}`;
 
 function mpScoreHtml() {
   const mine = net.scores[net.myId] || 0;
@@ -1693,7 +1904,7 @@ function hostHandle(msg, conn) {
     net.names[msg.id] = cleanName(msg.name);
     if (!(msg.id in net.scores)) net.scores[msg.id] = 0;
     (conn || net.conns.get(msg.id))?.send({
-      t: 'welcome', id: net.myId, kills: net.kills, scores: net.scores, names: net.names,
+      t: 'welcome', id: net.myId, map: MAP_ID, kills: net.kills, scores: net.scores, names: net.names,
       over: game.state === 'over' ? net.winner : null,
       crates: allBoxes.filter(b => b.ch === 'b').map(b => [b.gi, Math.round(b.hp)]),
     });
@@ -1710,6 +1921,8 @@ function handle(msg) {
   const from = msg.id;
   switch (msg.t) {
     case 'welcome':
+      // the room plays another map: reload into it (the link then carries the right one)
+      if (msg.map && msg.map !== MAP_ID && MAP_IDS.includes(msg.map)) { settings.map = msg.map; saveSettings(); location.hash = `room=${net.room}&map=${msg.map}`; location.reload(); return; }
       net.kills = +msg.kills || 5; net.scores = msg.scores || {}; net.names = msg.names || {};
       for (const [gi, hp] of Array.isArray(msg.crates) ? msg.crates : []) {
         const b = allBoxes[gi | 0];
@@ -1843,7 +2056,7 @@ function hostRoom() {
   const peer = net.peer = new Peer(PEER_PREFIX + code);
   peer.on('open', id => {
     net.myId = id; net.names = { [id]: myName }; net.scores = { [id]: 0 }; net.status = `кімната ${code}`;
-    history.replaceState(null, '', `#room=${code}`);
+    history.replaceState(null, '', `#room=${code}&map=${MAP_ID}`);
     showMsg('Кімнату створено — Esc, щоб скопіювати лінк для друзів', 3.5);
   });
   peer.on('connection', conn => {
@@ -1917,6 +2130,8 @@ $('panel').addEventListener('click', e => {
     const raw = el.dataset.v;
     settings[el.dataset.k] = isNaN(+raw) ? raw : +raw;
     saveSettings();
+    // the level is built at load, so a different map means a reload
+    if (el.dataset.k === 'map' && raw !== MAP_ID) { history.replaceState(null, '', location.pathname); location.reload(); return; }
     if (game.state === 'playing' && game.mode === 'bots') game.state = 'menu';
     showPanel(); return;
   }
