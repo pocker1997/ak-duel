@@ -63,7 +63,7 @@
   #breath i{display:block;height:100%;background:#8fd3ff}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 </head>
 <body>
 <div id="hud">
@@ -86,6 +86,7 @@
 
 <script type="module">
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 const V3 = THREE.Vector3, DEG = Math.PI / 180;
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -945,27 +946,209 @@ function leanRoom(c, side) {
 
 const BOT_COLORS = [0x8e2f28, 0x2f5a8e, 0x8e7a2f, 0x5e2f8e, 0x2f8e5a];
 const bots = [];
-// soldier mesh shared by bots and remote players; both guns are built, one is shown
+// ---- third-person soldier: jointed body holding the real rifle models, procedurally animated ----
+// Hierarchy: root (position, yaw) → body (fall / lean) → pelvis (height from leg FK) → hips→knees, spine → neck→head,
+// arms (two-bone IK to the rifle's grip and handguard), aimRig → rifle.
+const TP_GUN_SCALE = 0.72; // the viewmodels are built oversized for the first-person view
+const GUN_PTS = {
+  ak: { grip: new V3(0, -0.12, 0.06), fore: new V3(0, -0.075, -0.34), muzzle: new V3(0, -0.045, -0.83) },
+  sniper: { grip: new V3(0, -0.13, 0.0), fore: new V3(0, -0.1, -0.42), muzzle: new V3(0, -0.06, -1.0), glint: new V3(0, 0, -0.42) },
+};
+const tpGunCache = {};
+// merge the viewmodel parts per material once; every soldier then shares a few geometries (few draw calls per rifle)
+function tpGunParts(id) {
+  if (tpGunCache[id]) return tpGunCache[id];
+  const src = id === 'ak' ? buildAK(vmMat.metal, vmMat.wood, vmMat.bake) : buildSniper(vmMat);
+  src.g.updateMatrixWorld(true);
+  const body = new Map(), mag = new Map();
+  src.g.traverse(o => {
+    if (!o.isMesh) return;
+    let inMag = false; for (let p = o.parent; p; p = p.parent) if (p === src.mag) inMag = true;
+    const m = inMag ? mag : body;
+    if (!m.has(o.material)) m.set(o.material, []);
+    m.get(o.material).push(o.geometry.clone().applyMatrix4(o.matrixWorld));
+  });
+  const merge = m => [...m].map(([mat, geos]) => ({ mat, geo: mergeGeometries(geos) }));
+  return (tpGunCache[id] = { body: merge(body), mag: merge(mag) });
+}
+function makeTpGun(id) {
+  const P = tpGunParts(id), g = new THREE.Group(), mag = new THREE.Group();
+  for (const { geo, mat } of P.body) { const m = new THREE.Mesh(geo, mat); m.castShadow = true; g.add(m); }
+  for (const { geo, mat } of P.mag) { const m = new THREE.Mesh(geo, mat); m.castShadow = true; mag.add(m); }
+  g.add(mag);
+  const muzzle = new THREE.Object3D(); muzzle.position.copy(GUN_PTS[id].muzzle); g.add(muzzle);
+  const flash = makeFlash((id === 'sniper' ? 0.5 : 0.35) / TP_GUN_SCALE); muzzle.add(flash);
+  g.scale.setScalar(TP_GUN_SCALE);
+  return { g, mag, flash, pts: GUN_PTS[id], home: new V3(0.07, 0.11, -0.33) };
+}
+const LEG = { thigh: 0.44, shin: 0.47 }, ARM = { upper: 0.3, fore: 0.3 };
 function buildSoldier(i) {
-  const mats = { shirt: new THREE.MeshLambertMaterial({ color: BOT_COLORS[i % 5] }), pants: new THREE.MeshLambertMaterial({ color: 0x3a3d40 }), skin: new THREE.MeshLambertMaterial({ color: 0xd1a07a }), gun: new THREE.MeshLambertMaterial({ color: 0x2b2c2f }) };
-  const root = new THREE.Group(), body = new THREE.Group(); root.add(body); scene.add(root);
-  const add = (w, h, d, x, y, z, m, p = body) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); o.castShadow = true; p.add(o); return o; };
-  add(.15, .9, .2, -.1, .45, 0, mats.pants); add(.15, .9, .2, .1, .45, 0, mats.pants);
-  add(.46, .62, .26, 0, 1.2, 0, mats.shirt);
-  const head = add(.22, .24, .24, 0, 1.63, 0, mats.skin);
-  add(.23, .06, .25, 0, 1.76, 0, mats.pants); // cap
-  const arms = new THREE.Group(); arms.position.set(0, 1.42, 0); body.add(arms);
-  add(.1, .1, .45, .2, -.05, -.2, mats.shirt, arms); add(.1, .1, .4, -.12, -.05, -.25, mats.shirt, arms);
-  const gunAk = new THREE.Group(), gunSn = new THREE.Group(); arms.add(gunAk, gunSn);
-  add(.05, .08, .85, .06, .02, -.45, mats.gun, gunAk);
-  add(.05, .09, 1.15, .06, .02, -.55, mats.gun, gunSn); add(.045, .045, .3, .06, .1, -.3, mats.gun, gunSn); // rifle + scope
-  const glint = makeGlint(); glint.position.set(.06, .1, -.46); glint.visible = false; gunSn.add(glint);
-  const flash = makeFlash(0.35); flash.position.set(.06, .02, -.9); arms.add(flash);
-  return { root, body, arms, head, flash, glint, gunAk, gunSn, mats };
+  const M = c => new THREE.MeshLambertMaterial({ color: c });
+  const mats = { shirt: M(BOT_COLORS[i % 5]), pants: M(0x4b4d3a), skin: M(0xd1a07a), gear: M(0x3c4131), boots: M(0x24211d) };
+  const root = new THREE.Group(), body = new THREE.Group(), pelvis = new THREE.Group();
+  root.add(body); body.add(pelvis); scene.add(root);
+  const box = (parent, w, h, d, x, y, z, m) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); o.castShadow = true; parent.add(o); return o; };
+  box(pelvis, 0.34, 0.2, 0.22, 0, 0.03, 0, mats.pants);
+  const legs = [-1, 1].map(side => {
+    const hip = new THREE.Group(); hip.position.set(0.1 * side, 0, 0); pelvis.add(hip);
+    box(hip, 0.15, LEG.thigh, 0.17, 0, -LEG.thigh / 2, 0, mats.pants);
+    const knee = new THREE.Group(); knee.position.y = -LEG.thigh; hip.add(knee);
+    box(knee, 0.13, 0.42, 0.14, 0, -0.21, 0, mats.pants);
+    box(knee, 0.14, 0.09, 0.28, 0, -0.43, -0.05, mats.boots);
+    return { hip, knee, side };
+  });
+  const spine = new THREE.Group(); spine.position.y = 0.05; pelvis.add(spine);
+  box(spine, 0.4, 0.5, 0.23, 0, 0.27, 0, mats.shirt);        // torso
+  box(spine, 0.43, 0.36, 0.29, 0, 0.3, 0, mats.gear);        // plate carrier
+  box(spine, 0.32, 0.11, 0.07, 0, 0.19, -0.17, mats.gear);   // mag pouches
+  box(spine, 0.28, 0.34, 0.13, 0, 0.32, 0.2, mats.gear);     // assault pack
+  const neck = new THREE.Group(); neck.position.y = 0.52; spine.add(neck);
+  const head = new THREE.Group(); head.position.y = 0.02; neck.add(head);
+  box(head, 0.19, 0.22, 0.21, 0, 0.1, 0, mats.skin);
+  const helmet = new THREE.Mesh(new THREE.CylinderGeometry(0.125, 0.14, 0.13, 10), mats.gear);
+  helmet.position.set(0, 0.2, 0.01); helmet.castShadow = true; head.add(helmet);
+  const aimRig = new THREE.Group(); aimRig.position.y = 0.46; spine.add(aimRig);
+  const armParts = [-1, 1].map(side => {
+    const upper = new THREE.Group(), fore = new THREE.Group(); spine.add(upper, fore);
+    box(upper, 0.1, ARM.upper, 0.1, 0, -ARM.upper / 2, 0, mats.shirt);
+    box(fore, 0.09, ARM.fore - 0.03, 0.09, 0, -(ARM.fore - 0.03) / 2, 0, mats.shirt);
+    box(fore, 0.08, 0.09, 0.1, 0, -ARM.fore, 0, mats.boots); // glove
+    return { upper, fore, side, sh: new V3(0.2 * side, 0.46, 0) };
+  });
+  const guns = { ak: makeTpGun('ak'), sniper: makeTpGun('sniper') };
+  for (const gn of Object.values(guns)) { gn.g.position.copy(gn.home); aimRig.add(gn.g); }
+  const glint = makeGlint(); glint.position.copy(GUN_PTS.sniper.glint); glint.visible = false; guns.sniper.g.add(glint);
+  return {
+    root, body, pelvis, spine, neck, head, aimRig, legs, armParts, guns, tpGun: guns.ak, flash: guns.ak.flash, glint, mats,
+    anim: { phase: Math.random() * 6, spd: 0, lastYaw: 0, ready: 0, sprint: 0, crouch: 0, kick: 0, dead: false, deathT: 0, fallDir: 1, limp: [0, 0, 0, 0], gd: null },
+  };
 }
 function setSoldierWeapon(s, id) {
-  const sn = id === 'sniper'; s.gunAk.visible = !sn; s.gunSn.visible = sn;
-  s.flash.position.z = sn ? -1.15 : -.9; s.flash.scale.setScalar(sn ? 0.5 : 0.35);
+  for (const [k, gn] of Object.entries(s.guns)) { gn.g.visible = k === id; gn.flash.visible = false; }
+  s.tpGun = s.guns[id]; s.flash = s.tpGun.flash;
+}
+const _ik = { d: new V3(), p: new V3(), e: new V3(), h: new V3(), t: new V3(), DOWN: new V3(0, -1, 0) };
+// two-bone IK in spine space: shoulder → elbow → hand, elbow pushed down and out
+function solveArm(arm, T) {
+  const S = arm.sh, d = _ik.d.subVectors(T, S);
+  let len = d.length(); d.divideScalar(len || 1);
+  len = clamp(len, 0.08, (ARM.upper + ARM.fore) * 0.999);
+  const cosA = (ARM.upper ** 2 + len * len - ARM.fore ** 2) / (2 * ARM.upper * len), sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
+  const pole = _ik.p.set(arm.side * 0.7, -1, 0.25); pole.addScaledVector(d, -pole.dot(d)).normalize();
+  const E = _ik.e.copy(S).addScaledVector(d, ARM.upper * cosA).addScaledVector(pole, ARM.upper * sinA);
+  const H = _ik.h.copy(S).addScaledVector(d, len);
+  arm.upper.position.copy(S); arm.upper.quaternion.setFromUnitVectors(_ik.DOWN, _ik.t.subVectors(E, S).normalize());
+  arm.fore.position.copy(E); arm.fore.quaternion.setFromUnitVectors(_ik.DOWN, _ik.t.subVectors(H, E).normalize());
+}
+// height of the hip joint above the foot for given joint angles
+const legHeight = (tx, tz, k) => (LEG.thigh * Math.cos(tx) + LEG.shin * Math.cos(tx + k)) * Math.cos(tz);
+const _sa = new V3(), _sb = new V3();
+// st: { vel, yaw, pitch, crouch, lean, alive, aiming, reloadP (0..1 or -1), bandaging }
+function animateSoldier(c, dt, st) {
+  const A = c.anim, f = c.fl;
+  c.root.position.copy(c.pos); c.root.rotation.y = st.yaw;
+  if (!st.alive) { animateDeath(c, dt); return; }
+  if (A.dead) resetSoldierPose(c);
+  // gait: phase advances with ground speed; legs swing along the direction of travel relative to facing
+  const sp = Math.hypot(st.vel.x, st.vel.z);
+  A.spd += (sp - A.spd) * Math.min(1, dt * 8);
+  A.crouch += (st.crouch - A.crouch) * Math.min(1, dt * 8);
+  const cr = A.crouch;
+  const vf = -st.vel.x * Math.sin(st.yaw) - st.vel.z * Math.cos(st.yaw), vs = st.vel.x * Math.cos(st.yaw) - st.vel.z * Math.sin(st.yaw);
+  const yawRate = dt > 0 ? wrapAngle(st.yaw - A.lastYaw) / dt : 0; A.lastYaw = st.yaw;
+  A.phase += (A.spd / (1.2 + A.spd * 0.14)) * 2 * Math.PI * dt;
+  const shuffle = A.spd < 0.4 ? Math.min(1, Math.abs(yawRate) * 0.4) : 0; // stepping on the spot while turning
+  A.phase += shuffle * 7 * dt;
+  const moveK = clamp(A.spd / 4.5, 0, 1.4);
+  const amp = (0.42 * Math.min(1, moveK) + 0.3 * Math.max(0, moveK - 1)) * (1 - 0.45 * cr) + shuffle * 0.12;
+  const dirF = A.spd > 0.25 ? vf / A.spd : 1, dirS = A.spd > 0.25 ? vs / A.spd : 0;
+  let pelvisY = 0;
+  for (const L of c.legs) {
+    const ph = A.phase + (L.side > 0 ? Math.PI : 0), swing = Math.sin(ph) * amp;
+    const tx = 1.25 * cr + swing * dirF, tz = swing * dirS * 0.7;
+    const k = -(2.05 * cr + 0.08 + Math.max(0, Math.cos(ph)) * (0.5 + 0.4 * Math.min(1, moveK)) * Math.min(1, moveK * 1.6 + shuffle));
+    L.hip.rotation.set(tx, 0, tz); L.knee.rotation.x = k;
+    pelvisY = Math.max(pelvisY, legHeight(tx, tz, k));
+  }
+  c.pelvis.position.y = pelvisY + 0.02 + clamp(f.d * 0.12, -0.25, 0.05) - (c.legWound ? 0.03 : 0);
+  c.pelvis.rotation.set(0, Math.sin(A.phase) * 0.12 * Math.min(1, moveK), Math.cos(A.phase) * 0.04 * Math.min(1, moveK));
+  // weapon handling: low ready when calm, shouldered when aiming, port arms when sprinting
+  A.ready += ((st.aiming && !st.bandaging ? 1 : 0) - A.ready) * Math.min(1, dt * 6);
+  A.sprint += ((moveK > 1.02 && !st.aiming ? 1 : 0) - A.sprint) * Math.min(1, dt * 5);
+  A.kick = Math.max(0, A.kick - dt * 0.6);
+  const rd = A.ready * (1 - A.sprint), low = 1 - rd;
+  const breathe = Math.sin(game.time * 1.7) * 0.015;
+  c.body.rotation.set(clamp(f.x * 0.4, -0.3, 0.3), 0, -st.lean * 0.1);
+  c.spine.rotation.set(
+    st.pitch * 0.35 * rd - 0.28 * cr - 0.14 * Math.max(0, moveK - 0.8) + breathe + clamp(f.x * 0.7, -0.5, 0.5),
+    -c.pelvis.rotation.y + clamp(f.y, -0.6, 0.6),
+    -st.lean * 0.35 + clamp(f.z, -0.5, 0.5));
+  c.head.rotation.set(st.pitch * 0.3 * rd - 0.12 * rd + 0.28 * cr * low + clamp(f.h, -0.7, 0.7), 0, 0);
+  let ax = st.pitch * 0.65 * rd - 0.55 * low + 0.35 * cr * low, ay = 0.32 * low, az = 0;
+  ax = lerp(ax, -0.2, A.sprint); ay = lerp(ay, 0.95, A.sprint); az = lerp(az, 0.5, A.sprint);
+  let tilt = 0;
+  if (st.reloadP >= 0) { tilt = Math.sin(clamp(st.reloadP, 0, 1) * Math.PI); ax -= 0.25 * tilt; az += 0.45 * tilt; }
+  if (st.bandaging) { ax = -1.0; ay = 0.6; }
+  c.aimRig.rotation.set(ax, ay, az);
+  c.tpGun.g.position.set(c.tpGun.home.x, c.tpGun.home.y, c.tpGun.home.z + A.kick);
+  // hands on the rifle (IK), left hand to the chest pouch mid-reload, both hands on the thigh while bandaging
+  c.root.updateMatrixWorld(true);
+  const tR = c.spine.worldToLocal(c.tpGun.g.localToWorld(_sa.copy(c.tpGun.pts.grip)));
+  const tL = c.spine.worldToLocal(c.tpGun.g.localToWorld(_sb.copy(c.tpGun.pts.fore)));
+  if (st.reloadP >= 0) {
+    const p = st.reloadP, k = p < 0.15 ? p / 0.15 * 0.3 : p < 0.55 ? 1 : p < 0.7 ? 1 - (p - 0.55) / 0.15 : 0;
+    tL.lerp(_ik.t.set(-0.06, 0.16, -0.2), k);
+    c.tpGun.mag.visible = !(p > 0.3 && p < 0.55);
+  } else c.tpGun.mag.visible = true;
+  if (st.bandaging) { tL.set(-0.14, -0.15, -0.14); tR.set(-0.04, -0.12, -0.16); }
+  for (const arm of c.armParts) solveArm(arm, arm.side > 0 ? tR : tL);
+}
+// death: knees give out, the body topples the way the last bullet pushed it, arms go limp, the rifle falls away
+function animateDeath(c, dt) {
+  const A = c.anim;
+  if (!A.dead) {
+    A.dead = true; A.deathT = 0; A.fallDir = (c.lastHitLz ?? 1) >= 0 ? 1 : -1;
+    A.limp = [Math.random(), Math.random(), Math.random(), Math.random()];
+    for (const gn of Object.values(c.guns)) gn.flash.visible = false;
+    if (c.glint) c.glint.visible = false;
+    c.root.updateMatrixWorld(true);
+    scene.attach(c.tpGun.g);
+    A.gd = { v: new V3(gauss() * 0.8, 1 + Math.random(), gauss() * 0.8), w: new V3(gauss() * 4, gauss() * 4, gauss() * 4), rest: false };
+  }
+  A.deathT += dt;
+  const t = A.deathT, buckle = 1 - Math.pow(1 - Math.min(1, t / 0.3), 2);
+  const fall = t < 0.12 ? 0 : Math.min(1, ((t - 0.12) / 0.5) ** 2);
+  const bounce = fall >= 1 ? Math.exp(-(t - 0.62) * 9) * Math.sin((t - 0.62) * 22) * 0.06 : 0;
+  c.body.rotation.set(A.fallDir * (Math.PI / 2 - 0.1) * fall + bounce, 0, (A.limp[0] - 0.5) * 0.3 * fall);
+  let hy = 0;
+  for (const L of c.legs) {
+    const r = A.limp[L.side > 0 ? 1 : 2];
+    const tx = (0.7 + 0.5 * r) * buckle * (1 - 0.6 * fall), k = -(1.3 + 0.6 * r) * buckle * (1 - 0.5 * fall);
+    L.hip.rotation.set(tx, 0, (r - 0.5) * 0.4 * fall); L.knee.rotation.x = k;
+    hy = Math.max(hy, legHeight(tx, 0, k));
+  }
+  c.pelvis.position.y = hy;
+  c.pelvis.rotation.set(0, 0, 0);
+  c.spine.rotation.set(-0.35 * buckle * (1 - fall) + 0.2 * fall * A.fallDir, (A.limp[3] - 0.5) * 0.5, 0);
+  c.head.rotation.set(-0.5 * buckle + 0.4 * fall * A.fallDir, (A.limp[0] - 0.5), 0);
+  // limp arms: hands hang from the shoulders, then flop outward as the body lands
+  for (const arm of c.armParts) solveArm(arm, _sa.set(arm.sh.x + arm.side * 0.25 * fall, arm.sh.y - 0.5 + 0.2 * fall, arm.sh.z - 0.1));
+  // the dropped rifle tumbles to the ground and lies on its side
+  const d = A.gd, g = c.tpGun.g;
+  if (d && !d.rest) {
+    d.v.y -= 9.81 * dt; g.position.addScaledVector(d.v, dt);
+    g.rotation.x += d.w.x * dt; g.rotation.y += d.w.y * dt; g.rotation.z += d.w.z * dt;
+    const s = surfaceBelow(g.position.x, g.position.y, g.position.z), fy = (s ? s.y : 0) + 0.04;
+    if (g.position.y <= fy) { g.position.y = fy; d.rest = true; g.rotation.set(0, g.rotation.y, Math.PI / 2 * (Math.random() < 0.5 ? 1 : -1)); }
+  }
+}
+function resetSoldierPose(c) {
+  const A = c.anim;
+  A.dead = false; A.gd = null; A.ready = 0; A.sprint = 0; A.kick = 0;
+  c.aimRig.add(c.tpGun.g);
+  for (const gn of Object.values(c.guns)) { gn.g.position.copy(gn.home); gn.g.rotation.set(0, 0, 0); gn.g.scale.setScalar(TP_GUN_SCALE); }
+  c.body.rotation.set(0, 0, 0);
+  for (const k in c.fl) c.fl[k] = 0;
 }
 function createBot(i, weaponId) {
   const s = buildSoldier(i), sniper = weaponId === 'sniper';
@@ -976,9 +1159,9 @@ function createBot(i, weaponId) {
     seeing: false, reaction: 0, aimErr: 0, errX: 0, errY: 0, errTX: 0, errTY: 0, errT: 0, aimHead: false,
     lastKnown: new V3(), lastKnownT: -99, alertT: -99, burst: 0, burstPause: 0, strafe: 1, strafeT: 0, holdStill: false,
     path: null, pi: 0, pathT: 0, stuckT: 0, flashT: 0, hurtFlash: 0, fallT: 0, calloutT: 0, dripT: 0,
-    peekT: 0, leanWant: 0, peekHold: 0, peekBanT: -99,
+    peekT: 0, leanWant: 0, peekHold: 0, peekBanT: -99, crouch: 0, crouchWant: 0, sneaking: false,
     ...s, glint: sniper ? s.glint : null, fl: { x: 0, vx: 0, z: 0, vz: 0, y: 0, vy: 0, d: 0, vd: 0, h: 0, vh: 0 },
-    headY() { return this.pos.y + 1.63; },
+    headY() { return this.pos.y + lerp(1.63, 1.15, this.crouch); },
   };
   resetBodyState(b);
   return b;
@@ -1024,8 +1207,8 @@ function respawnBot(b) {
   resetBodyState(b);
   Object.assign(b, { seeing: false, path: null, burst: 0, recoilP: 0, recoilY: 0, lastKnownT: -99, alertT: -99, fallT: 0, leanWant: 0, peekHold: 0 });
   b.pos.copy(s); b.yaw = faceCenter(s); b.pitch = 0;
-  b.body.rotation.set(0, 0, 0); b.body.position.y = 0; b.head.rotation.x = 0; b.root.visible = true;
-  for (const k in b.fl) b.fl[k] = 0;
+  b.crouch = b.crouchWant = 0; b.root.visible = true;
+  resetSoldierPose(b);
 }
 function startMatch() {
   game.state = 'playing'; game.mode = 'bots'; game.pScore = game.bScore = 0; game.time = 0;
@@ -1334,6 +1517,12 @@ function botPeek(b, dt) {
   b.peekT -= dt;
   if (b.peekT <= 0) {
     b.peekT = 0.2; b.leanWant = 0;
+    // take a knee: out of sight while reloading/bandaging, when sneaking, or to shoot if the target is still visible that low
+    let cw = 0;
+    if (b.bandaging > 0 || (b.gun.reloading > 0 && !b.seeing)) cw = 1;
+    else if (b.seeing && player.alive && (b.holdStill || b.gun.w.scope)) cw = los(new V3(b.pos.x, b.pos.y + 1.15, b.pos.z), eyeOf(player)) ? 1 : 0;
+    else if (b.sneaking) cw = 1;
+    b.crouchWant = cw;
     if (t - b.lastKnownT < 6 && t > b.peekBanT && b.gun.reloading <= 0 && b.bandaging <= 0) {
       const tgt = b.seeing && player.alive ? eyeOf(player) : new V3(b.lastKnown.x, 1.4, b.lastKnown.z);
       const base = new V3(b.pos.x, b.headY(), b.pos.z);
@@ -1361,7 +1550,7 @@ function botShoot(b, distP) {
   b.recoilP += w.recoilV * (0.85 + Math.random() * 0.35) * (b.armWound ? WOUND.armRecoil : 1); b.recoilY += gauss() * (w.scope ? 1 : 0.35) * DEG;
   g.bloom = Math.min(w.bloomMax, g.bloom + w.bloomPerShot);
   if (w.scope) { g.boltT = w.bolt; g.boltDone = false; b.aimErr = Math.max(b.aimErr, BOT.aimErrMin * 3); }
-  b.flash.visible = true; b.flash.material.rotation = Math.random() * 6; b.flashT = 0.05;
+  b.flash.visible = true; b.flash.material.rotation = Math.random() * 6; b.flashT = 0.05; b.anim.kick = w.scope ? 0.09 : 0.045;
   b.flash.getWorldPosition(botLight.position); botLightT = 0.05;
   const d = camera.position.distanceTo(b.pos);
   play3d(w.scope ? buf.sniper : buf.shot, e, { gain: w.scope ? 1.5 : 1.3, lp: clamp(14000 - d * 180, 2500, 14000) });
@@ -1369,9 +1558,7 @@ function botShoot(b, distP) {
 function updateBot(b, dt) {
   const g = b.gun, w = g.w;
   if (!b.alive) {
-    b.fallT = Math.min(1, b.fallT + dt * 2.5);
-    b.body.rotation.x = (Math.PI / 2) * (1 - Math.pow(1 - b.fallT, 3));
-    if (b.glint) b.glint.visible = false;
+    animateSoldier(b, dt, { vel: b.vel, yaw: b.yaw, alive: false });
     b.deadT -= dt;
     if (b.deadT <= 0 && game.state === 'playing') respawnBot(b);
     return;
@@ -1400,6 +1587,7 @@ function updateBot(b, dt) {
   if (b.bandaging <= 0 && b.bleed > 0 && !b.seeing && g.reloading <= 0 && t - b.lastKnownT > 1) startBandage(b);
   tickBandage(b, dt);
   botPeek(b, dt);
+  b.crouch += (b.crouchWant - b.crouch) * Math.min(1, dt * 5);
 
   const ph = eyeOf(player), be = eyeOf(b);
   const dxp = ph.x - be.x, dzp = ph.z - be.z, distP = Math.hypot(dxp, dzp);
@@ -1453,6 +1641,7 @@ function updateBot(b, dt) {
   // ---- movement ----
   let wx = 0, wz = 0, speed = 0;
   const sy = Math.sin(b.yaw), cy = Math.cos(b.yaw);
+  b.sneaking = false;
   if (b.bandaging > 0 || Math.abs(b.leanWant) > 0) { b.path = null; } // bandaging or holding a corner
   else if (b.seeing) {
     b.path = null;
@@ -1470,12 +1659,13 @@ function updateBot(b, dt) {
     else if (!hunting && !b.path) botSetPath(b, randomWalkCell(b));
     const d = followPath(b);
     // hunting: run from afar (loud), sneak on the last stretch (quiet)
-    if (d) { [wx, wz] = d; speed = hunting ? (b.pos.distanceTo(b.lastKnown) < BOT.sneakDist ? BOT.sneakSpeed : BOT.runSpeed) : BOT.patrolSpeed; }
+    if (d) { [wx, wz] = d; speed = hunting ? (b.pos.distanceTo(b.lastKnown) < BOT.sneakDist ? BOT.sneakSpeed : BOT.runSpeed) : BOT.patrolSpeed; b.sneaking = speed === BOT.sneakSpeed; }
     else if (hunting) b.lastKnownT = -99; // reached last known spot, nothing here
     if (speed > 0 && Math.hypot(b.vel.x, b.vel.z) < 0.3) { b.stuckT += dt; if (b.stuckT > 0.8) { b.path = null; b.stuckT = 0; botSetPath(b, randomWalkCell(b)); } }
     else b.stuckT = 0;
   }
   if (b.legWound) speed *= WOUND.legSpeed;
+  if (b.crouch > 0.5) speed = Math.min(speed, BOT.sneakSpeed);
   const wl = Math.hypot(wx, wz); if (wl > 0) { wx /= wl; wz /= wl; }
   b.vel.x += (wx * speed - b.vel.x) * Math.min(1, 9 * dt);
   b.vel.z += (wz * speed - b.vel.z) * Math.min(1, 9 * dt);
@@ -1484,9 +1674,9 @@ function updateBot(b, dt) {
   stepTick(b, dt);
 
   // ---- visuals ----
-  b.root.position.copy(b.pos); b.root.rotation.y = b.yaw;
-  b.arms.rotation.x = b.bandaging > 0 ? -0.9 : b.pitch + b.recoilP;
   updateFlinch(b, dt);
+  animateSoldier(b, dt, { vel: b.vel, yaw: b.yaw, pitch: b.pitch + b.recoilP, crouch: b.crouch, lean: b.lean, alive: true,
+    aiming: b.seeing || t < b.alertT, reloadP: g.reloading > 0 ? 1 - g.reloading / g.reloadDur : -1, bandaging: b.bandaging > 0 });
   if (b.flashT > 0) { b.flashT -= dt; if (b.flashT <= 0) b.flash.visible = false; }
   b.hurtFlash = Math.max(0, b.hurtFlash - dt * 6);
   b.mats.shirt.emissive.setRGB(b.hurtFlash * 0.8, 0, 0); b.mats.skin.emissive.setRGB(b.hurtFlash * 0.8, 0, 0);
@@ -1504,6 +1694,7 @@ function flinch(b, part, dx, dz) {
   const lz = dx * Math.sin(b.yaw) + dz * Math.cos(b.yaw);  // + = backwards
   const k = { head: 9, torso: 6, arm: 4, legs: 2.5 }[part];
   const f = b.fl;
+  b.lastHitLz = lz;
   f.vx += lz * k; f.vz -= lx * k * 0.8; f.vy += (part === 'arm' ? 1 : 0.4) * k * (Math.random() < 0.5 ? -1 : 1) * 0.6;
   if (part === 'legs') { f.vd -= 2.2; f.vx -= 2.5; }           // knee buckles
   if (part === 'head') f.vh += lz * 14;                          // head snaps
@@ -1514,13 +1705,6 @@ function updateFlinch(b, dt) {
   const f = b.fl, K = 140, C = 15;
   for (const [x, v] of [['x', 'vx'], ['z', 'vz'], ['y', 'vy'], ['d', 'vd'], ['h', 'vh']]) {
     f[v] += (-K * f[x] - C * f[v]) * dt; f[x] += f[v] * dt;
-  }
-  if (b.alive) {
-    // lean tilts the whole body around the feet so the head moves LEAN.dist sideways
-    const leanRoll = -b.lean * Math.atan2(LEAN.dist, 1.63);
-    b.body.rotation.set(clamp(f.x, -0.5, 0.5), clamp(f.y, -0.6, 0.6), clamp(f.z, -0.5, 0.5) + leanRoll);
-    b.body.position.y = clamp(f.d * 0.12, -0.25, 0.05) - (b.legWound ? 0.03 : 0);
-    b.head.rotation.x = clamp(f.h, -0.7, 0.7);
   }
 }
 
@@ -1550,7 +1734,6 @@ function kill(victim, part, attacker) {
   victim.alive = false; victim.deadT = 3; victim.bleed = 0; victim.bandaging = 0; victim.lean = 0;
   if (victim !== player) {
     game.pScore++; victim.fallT = 0; victim.flash.visible = false;
-    victim.body.position.y = 0; victim.body.rotation.set(0, 0, 0); victim.head.rotation.x = 0;
     addPool(victim.pos.x + Math.sin(victim.yaw) * 0.8, victim.pos.y + 0.2, victim.pos.z + Math.cos(victim.yaw) * 0.8);
     showMsg(part === 'head' ? `ХЕДШОТ — ${victim.name}` : part === 'bleed' ? `${victim.name} стік кров'ю` : `${victim.name} знищений`, 1.8);
   } else {
@@ -1943,7 +2126,7 @@ function handle(msg) {
       const [ox, oy, oz] = msg.o.map(Number), [dx, dy, dz] = msg.d.map(Number);
       if (![ox, oy, oz, dx, dy, dz].every(isFinite)) break;
       bullets.push({ x: ox, y: oy, z: oz, vx: dx * w.velocity, vy: dy * w.velocity, vz: dz * w.velocity, owner: a, w, dist: 0, cracked: false, dmgMul: 1, remote: true });
-      a.flash.visible = true; a.flash.material.rotation = Math.random() * 6; a.flashT = 0.05;
+      a.flash.visible = true; a.flash.material.rotation = Math.random() * 6; a.flashT = 0.05; a.anim.kick = w.scope ? 0.09 : 0.045;
       a.flash.getWorldPosition(botLight.position); botLightT = 0.05;
       play3d(w.scope ? buf.sniper : buf.shot, new V3(ox, oy, oz), { gain: w.scope ? 1.5 : 1.3, lp: clamp(14000 - camera.position.distanceTo(a.pos) * 180, 2500, 14000) });
       break;
@@ -1987,9 +2170,9 @@ function createAvatar(id) {
   const a = {
     isAvatar: true, id, name: net.names[id] || 'Гравець', pos: new V3(-100, 0, -100), tpos: new V3(-100, 0, -100), vel: new V3(),
     r: 0.3, yaw: 0, tyaw: 0, pitch: 0, tpitch: 0, crouch: 0, lean: 0, alive: false, weaponId: 'ak', onGround: true, stepAcc: 0,
-    fallT: 1, flashT: 0, hurtFlash: 0, recoilP: 0, recoilY: 0, burstPause: 0, legWound: false, bleedVis: false, dripT: 0, scoped: false,
+    reloadP: -1, bandVis: false, fallT: 1, flashT: 0, hurtFlash: 0, recoilP: 0, recoilY: 0, burstPause: 0, legWound: false, bleedVis: false, dripT: 0, scoped: false,
     fl: { x: 0, vx: 0, z: 0, vz: 0, y: 0, vy: 0, d: 0, vd: 0, h: 0, vh: 0 },
-    headY() { return this.pos.y + lerp(1.63, 1.08, this.crouch); },
+    headY() { return this.pos.y + lerp(1.63, 1.15, this.crouch); },
     ...s,
   };
   avatars.set(id, a);
@@ -2001,13 +2184,13 @@ function applyState(id, m) {
   if (!p || p.length !== 3 || !p.every(isFinite)) return;
   const a = avatars.get(id) || createAvatar(id);
   const wasAlive = a.alive; a.alive = !!m.a;
-  if (a.alive && !wasAlive) { a.pos.set(p[0], p[1], p[2]); a.body.rotation.set(0, 0, 0); a.fallT = 0; for (const k in a.fl) a.fl[k] = 0; }
+  if (a.alive && !wasAlive) a.pos.set(p[0], p[1], p[2]);
   if (!a.alive && wasAlive) a.fallT = 0;
   a.tpos.set(p[0], p[1], p[2]);
   a.vel.set(+m.v?.[0] || 0, 0, +m.v?.[1] || 0);
   a.tyaw = +m.y || 0; a.tpitch = +m.pi || 0; a.crouch = clamp(+m.c || 0, 0, 1); a.lean = clamp(+m.l || 0, -1, 1);
   if (m.w !== a.weaponId && WEAPONS[m.w]) { a.weaponId = m.w; setSoldierWeapon(a, m.w); }
-  a.scoped = !!m.sc; a.bleedVis = !!m.bl;
+  a.scoped = !!m.sc; a.bleedVis = !!m.bl; a.reloadP = isFinite(+m.rl) ? +m.rl : -1; a.bandVis = !!m.bd;
 }
 function updateAvatars(dt) {
   for (const a of avatars.values()) {
@@ -2015,16 +2198,12 @@ function updateAvatars(dt) {
     if (a.pos.distanceTo(a.tpos) > 3) a.pos.copy(a.tpos); else a.pos.lerp(a.tpos, Math.min(1, dt * 14));
     a.yaw += wrapAngle(a.tyaw - a.yaw) * Math.min(1, dt * 16);
     a.pitch += (a.tpitch - a.pitch) * Math.min(1, dt * 16);
-    a.root.position.copy(a.pos); a.root.rotation.y = a.yaw; a.root.scale.y = lerp(1, 0.68, a.crouch);
     if (a.alive) {
-      a.arms.rotation.x = a.pitch;
       updateFlinch(a, dt);
       stepTick(a, dt);
       if (a.bleedVis) { a.dripT -= dt; if (a.dripT <= 0) { a.dripT = 0.35; spurt(a.pos.x + gauss() * 0.12, a.pos.y + 0.95, a.pos.z + gauss() * 0.12, 0, -1, 0, 1, 0.4, 0.3, 0.9); } }
-    } else {
-      a.fallT = Math.min(1, a.fallT + dt * 2.5);
-      a.body.rotation.set((Math.PI / 2) * (1 - Math.pow(1 - a.fallT, 3)), 0, 0);
     }
+    animateSoldier(a, dt, { vel: a.vel, yaw: a.yaw, pitch: a.pitch, crouch: a.crouch, lean: a.lean, alive: a.alive, aiming: true, reloadP: a.reloadP, bandaging: a.bandVis });
     if (a.flashT > 0) { a.flashT -= dt; if (a.flashT <= 0) a.flash.visible = false; }
     a.hurtFlash = Math.max(0, a.hurtFlash - dt * 6);
     a.mats.shirt.emissive.setRGB(a.hurtFlash * 0.8, 0, 0); a.mats.skin.emissive.setRGB(a.hurtFlash * 0.8, 0, 0);
@@ -2045,6 +2224,7 @@ function netTick(dt) {
     t: 'st', p: [r(player.pos.x), r(player.pos.y), r(player.pos.z)], v: [r(player.vel.x), r(player.vel.z)],
     y: r(player.yaw + player.recoilY), pi: r(player.pitch + player.recoilP), c: r(player.crouch), l: r(player.lean),
     w: player.weapon, a: player.alive ? 1 : 0, sc: isScoped() ? 1 : 0, bl: player.bleed > 0 ? 1 : 0,
+    rl: player.gun.reloading > 0 ? r(1 - player.gun.reloading / player.gun.reloadDur) : -1, bd: player.bandaging > 0 ? 1 : 0,
   });
 }
 
